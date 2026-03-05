@@ -7,6 +7,8 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = b.standardTargetOptions(.{}),
         .optimize = b.standardOptimizeOption(.{}),
+        .strip = true,
+        .single_threaded = true,
     }) });
 
     const options = b.addOptions();
@@ -16,6 +18,9 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
     const run_exe = b.addRunArtifact(exe);
+    if (b.args) |args| {
+        run_exe.addArgs(args);
+    }
 
     const run_step = b.step("run", "Run the application");
     run_step.dependOn(&run_exe.step);
