@@ -17,17 +17,18 @@ const USAGE_STR =
     \\
 ;
 
+/// Struct holding command-line options
 const Args = struct {
     print_filename: bool = false,
     min_len: usize = 4,
-    print_loc_format: u8 = undefined,
+    print_loc_format: ?u8 = null,
     print_help: bool = false,
     print_version: bool = false,
     files: [][:0]u8 = undefined,
 
     const ArgParseError = error{ MissingArgs, InvalidArgs, NotImplemented };
 
-    // parse argv array into the struct fields
+    /// Parses argv array into the struct fields
     fn parseArgs(self: *Args, argv: [][:0]u8) ArgParseError!void {
         // parse optional arguments starting with a dash '-'
         var index: usize = 1;
@@ -39,8 +40,7 @@ const Args = struct {
                 self.print_version = true;
                 return;
             } else if (std.mem.eql(u8, argv[index], "-f")) {
-                // self.print_filename = true;
-                return error.NotImplemented;
+                self.print_filename = true;
             } else if (std.mem.eql(u8, argv[index], "-n")) {
                 if (index + 1 >= argv.len) return error.MissingArgs;
                 index += 1;
@@ -49,13 +49,12 @@ const Args = struct {
                 };
                 if (self.min_len < 1 or self.min_len >= 1024) return error.InvalidArgs;
             } else if (std.mem.eql(u8, argv[index], "-t")) {
-                // if (index + 1 >= argv.len) return error.MissingArgs;
-                // index += 1;
-                // if (!(std.mem.eql(u8, argv[index], "o") or std.mem.eql(u8, argv[index], "d") or std.mem.eql(u8, argv[index], "x"))) {
-                //     return error.InvalidArgs;
-                // }
-                // self.print_loc_format = argv[index][0];
-                return error.NotImplemented;
+                if (index + 1 >= argv.len) return error.MissingArgs;
+                index += 1;
+                if (!(std.mem.eql(u8, argv[index], "o") or std.mem.eql(u8, argv[index], "d") or std.mem.eql(u8, argv[index], "x"))) {
+                    return error.InvalidArgs;
+                }
+                self.print_loc_format = argv[index][0];
             }
             index += 1;
         }
@@ -106,13 +105,33 @@ pub fn main() !void {
         defer allocator.free(bytes);
 
         var iter = StringIterator{ .bytes = bytes, .min_len = args.min_len };
-        while (iter.next()) |string| {
-            try stdout.print("{s}\n", .{string});
+        while (iter.next()) |s| {
+            try printString(s, file, args, stdout);
         }
     }
 }
 
-// read whole file into allocated buffer, needs to be free'd by the caller
+/// Formats output string based on provided args and prints it to writer
+fn printString(s: StringIterator.StringReturn, filename: [:0]u8, args: Args, writer: *std.Io.Writer) !void {
+    // not the cleanest approach but is simple and reliable
+    if (args.print_filename) {
+        if (args.print_loc_format) |f| switch (f) {
+            'o' => try writer.print("{s}    {o} {s}\n", .{ filename, s.index, s.string }),
+            'd' => try writer.print("{s}    {d} {s}\n", .{ filename, s.index, s.string }),
+            'x' => try writer.print("{s}    {x} {s}\n", .{ filename, s.index, s.string }),
+            else => unreachable,
+        } else try writer.print("{s}    {s}\n", .{ filename, s.string });
+    } else if (args.print_loc_format) |f| switch (f) {
+        'o' => try writer.print("{o} {s}\n", .{ s.index, s.string }),
+        'd' => try writer.print("{d} {s}\n", .{ s.index, s.string }),
+        'x' => try writer.print("{x} {s}\n", .{ s.index, s.string }),
+        else => unreachable,
+    } else {
+        try writer.print("{s}\n", .{s.string});
+    }
+}
+
+/// Reads whole file into allocated buffer, bytes need to be free'd by the caller
 fn readFile(path: [:0]const u8, allocator: Allocator) ![]u8 {
     const file = try std.fs.cwd().openFileZ(path, .{ .mode = .read_only });
     defer file.close();
@@ -126,13 +145,19 @@ fn readFile(path: [:0]const u8, allocator: Allocator) ![]u8 {
     return bytes;
 }
 
-// iterates over bytes and returns found strings with length equal or larger than min_len
+/// Iterator for yielding strings from bytes
 const StringIterator = struct {
     bytes: []u8,
     min_len: usize,
     index: usize = 0,
 
-    fn next(self: *StringIterator) ?[]u8 {
+    const StringReturn = struct {
+        string: []u8,
+        index: usize,
+    };
+
+    /// Iterates over bytes and yields found strings with length equal or larger than min_len
+    fn next(self: *StringIterator) ?StringReturn {
         var start: ?usize = null;
         for (self.bytes[self.index..], self.index..) |byte, i| {
             self.index += 1;
@@ -141,13 +166,13 @@ const StringIterator = struct {
             } else if (start) |s| {
                 start = null;
                 const len = i - s;
-                if (len >= self.min_len) return self.bytes[s..i];
+                if (len >= self.min_len) return StringReturn{ .string = self.bytes[s..i], .index = s };
             }
         }
         // handle string terminated by EOF
         if (start) |s| {
             const len = self.bytes.len - s;
-            if (len >= self.min_len) return self.bytes[s..];
+            if (len >= self.min_len) return StringReturn{ .string = self.bytes[s..], .index = s };
         }
         return null;
     }
