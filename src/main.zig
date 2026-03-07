@@ -1,4 +1,5 @@
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 const build_options = @import("build_options");
 
 const USAGE_STR =
@@ -98,41 +99,56 @@ pub fn main() !void {
 
     const allocator = std.heap.page_allocator;
     for (args.files) |file| {
-        scanFile(file, args.min_len, allocator, stdout) catch |err| {
+        const bytes = readFile(file, allocator) catch |err| {
             try stdout.print("Cannot read file {s}: {}\n", .{ file, err });
             return;
         };
+        defer allocator.free(bytes);
+
+        var iter = StringIterator{ .bytes = bytes, .min_len = args.min_len };
+        while (iter.next()) |string| {
+            try stdout.print("{s}\n", .{string});
+        }
     }
 }
 
-// reads file into allocated buffer and writes all found strings into the writer
-// TODO: add options for printing filename and location
-fn scanFile(path: [:0]const u8, min_len: usize, allocator: std.mem.Allocator, writer: *std.Io.Writer) !void {
+// read whole file into allocated buffer, needs to be free'd by the caller
+fn readFile(path: [:0]const u8, allocator: Allocator) ![]u8 {
     const file = try std.fs.cwd().openFileZ(path, .{ .mode = .read_only });
     defer file.close();
 
-    var file_buf: [4096]u8 = undefined;
-    var file_reader = file.reader(&file_buf);
-    var reader = &file_reader.interface;
+    var buf: [4 * 1024]u8 = undefined;
+    var file_reader = file.reader(&buf);
+    const reader = &file_reader.interface;
 
     const stat = try file.stat();
     const bytes = try reader.readAlloc(allocator, stat.size);
-    defer allocator.free(bytes);
-
-    var start: ?usize = null;
-    for (bytes, 0..) |byte, i| {
-        if (std.ascii.isPrint(byte)) {
-            if (start == null) start = i;
-        } else if (start) |s| {
-            const len = i - s;
-            if (len >= min_len) try writer.print("{s}\n", .{bytes[s..i]});
-            start = null;
-        }
-    }
-    // handle string terminated by EOF
-    if (start) |s| {
-        const len = bytes.len - s;
-        if (len >= min_len) try writer.print("{s}\n", .{bytes[s..]});
-    }
-    return;
+    return bytes;
 }
+
+// iterates over bytes and returns found strings with length equal or larger than min_len
+const StringIterator = struct {
+    bytes: []u8,
+    min_len: usize,
+    index: usize = 0,
+
+    fn next(self: *StringIterator) ?[]u8 {
+        var start: ?usize = null;
+        for (self.bytes[self.index..], self.index..) |byte, i| {
+            self.index += 1;
+            if (std.ascii.isPrint(byte)) {
+                if (start == null) start = i;
+            } else if (start) |s| {
+                start = null;
+                const len = i - s;
+                if (len >= self.min_len) return self.bytes[s..i];
+            }
+        }
+        // handle string terminated by EOF
+        if (start) |s| {
+            const len = self.bytes.len - s;
+            if (len >= self.min_len) return self.bytes[s..];
+        }
+        return null;
+    }
+};
