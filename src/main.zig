@@ -72,8 +72,8 @@ pub fn main() !void {
     const argv = try std.process.argsAlloc(alloc);
     defer std.process.argsFree(alloc, argv);
 
-    var buf: [1024]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&buf);
+    var stdout_buf: [1024]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
     const stdout = &stdout_writer.interface;
     defer stdout.flush() catch {};
 
@@ -98,13 +98,13 @@ pub fn main() !void {
 
     const allocator = std.heap.page_allocator;
     for (args.files) |file| {
-        const bytes = readFile(file, allocator) catch |err| {
+        var buf = readFile(file, allocator) catch |err| {
             try stdout.print("Cannot read file {s}: {}\n", .{ file, err });
             return;
         };
-        defer allocator.free(bytes);
+        defer buf.deinit();
 
-        var iter = StringIterator{ .bytes = bytes, .min_len = args.min_len };
+        var iter = StringIterator{ .bytes = buf.written(), .min_len = args.min_len };
         while (iter.next()) |s| {
             try printString(s, file, args, stdout);
         }
@@ -131,18 +131,19 @@ fn printString(s: StringIterator.StringReturn, filename: [:0]u8, args: Args, wri
     }
 }
 
-/// Reads whole file into allocated buffer, bytes need to be free'd by the caller
-fn readFile(path: [:0]const u8, allocator: Allocator) ![]u8 {
+/// Reads whole file into allocated buffer, needs to be deinited by the caller
+fn readFile(path: [:0]const u8, allocator: Allocator) !std.Io.Writer.Allocating {
     const file = try std.fs.cwd().openFileZ(path, .{ .mode = .read_only });
     defer file.close();
 
-    var buf: [4 * 1024]u8 = undefined;
-    var file_reader = file.reader(&buf);
+    var read_buf: [4 * 1024]u8 = undefined;
+    var file_reader = file.reader(&read_buf);
     const reader = &file_reader.interface;
 
-    const stat = try file.stat();
-    const bytes = try reader.readAlloc(allocator, stat.size);
-    return bytes;
+    var buf = std.Io.Writer.Allocating.init(allocator);
+    _ = try reader.streamRemaining(&buf.writer);
+
+    return buf;
 }
 
 /// Iterator for yielding strings from bytes
