@@ -3,13 +3,16 @@ const pkg = @import("build.zig.zon");
 
 pub fn build(b: *std.Build) void {
     const exe_name: []const u8 = @tagName(pkg.name);
-    const exe = b.addExecutable(.{ .name = exe_name, .root_module = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = b.standardTargetOptions(.{}),
-        .optimize = b.standardOptimizeOption(.{}),
-        .strip = true,
-        .single_threaded = true,
-    }) });
+    const exe = b.addExecutable(.{
+        .name = exe_name,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = b.standardTargetOptions(.{}),
+            .optimize = b.standardOptimizeOption(.{}),
+            // .strip = true,
+            .single_threaded = true,
+        }),
+    });
 
     const options = b.addOptions();
     options.addOption([]const u8, "exe_name", exe_name);

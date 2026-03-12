@@ -1,5 +1,4 @@
 const std = @import("std");
-const Allocator = std.mem.Allocator;
 const build_options = @import("build_options");
 
 const USAGE_STR =
@@ -96,69 +95,83 @@ pub fn main() !void {
         return;
     }
 
-    const allocator = std.heap.page_allocator;
     for (args.files) |file| {
-        var buf = readFile(file, allocator) catch |err| {
-            try stdout.print("Cannot read file {s}: {}\n", .{ file, err });
-            return;
-        };
-        defer buf.deinit();
-
-        var iter = StringIterator{ .bytes = buf.written(), .min_len = args.min_len };
-        while (iter.next()) |s| {
-            try printString(s, file, args, stdout);
-        }
+        try scanFile(file, args, stdout);
     }
 }
 
 /// Formats output string based on provided args and prints it to writer
-fn printString(s: StringIterator.StringReturn, filename: [:0]u8, args: Args, writer: *std.Io.Writer) !void {
+fn printString(s: String, filename: [:0]u8, args: Args, writer: *std.Io.Writer) !void {
     // not the cleanest approach but is simple and reliable
     if (args.print_filename) {
         if (args.print_loc_format) |f| switch (f) {
-            'o' => try writer.print("{s}    {o} {s}\n", .{ filename, s.index, s.string }),
-            'd' => try writer.print("{s}    {d} {s}\n", .{ filename, s.index, s.string }),
-            'x' => try writer.print("{s}    {x} {s}\n", .{ filename, s.index, s.string }),
+            'o' => try writer.print("{s}    {o} {s}\n", .{ filename, s.pos, s.string }),
+            'd' => try writer.print("{s}    {d} {s}\n", .{ filename, s.pos, s.string }),
+            'x' => try writer.print("{s}    {x} {s}\n", .{ filename, s.pos, s.string }),
             else => unreachable,
         } else try writer.print("{s}    {s}\n", .{ filename, s.string });
     } else if (args.print_loc_format) |f| switch (f) {
-        'o' => try writer.print("{o} {s}\n", .{ s.index, s.string }),
-        'd' => try writer.print("{d} {s}\n", .{ s.index, s.string }),
-        'x' => try writer.print("{x} {s}\n", .{ s.index, s.string }),
+        'o' => try writer.print("{o} {s}\n", .{ s.pos, s.string }),
+        'd' => try writer.print("{d} {s}\n", .{ s.pos, s.string }),
+        'x' => try writer.print("{x} {s}\n", .{ s.pos, s.string }),
         else => unreachable,
     } else {
         try writer.print("{s}\n", .{s.string});
     }
 }
 
-/// Reads whole file into allocated buffer, needs to be deinited by the caller
-fn readFile(path: [:0]const u8, allocator: Allocator) !std.Io.Writer.Allocating {
+/// Reads file in chunks scanning them for strings and writing formatted output to writer
+fn scanFile(path: [:0]u8, args: Args, writer: *std.Io.Writer) !void {
     const file = try std.fs.cwd().openFileZ(path, .{ .mode = .read_only });
     defer file.close();
 
-    var read_buf: [4 * 1024]u8 = undefined;
-    var file_reader = file.reader(&read_buf);
-    const reader = &file_reader.interface;
+    var buf: [64 * 1024]u8 = undefined;
+    var carry_buf: [64 * 1024]u8 = undefined;
+    var carry_len: usize = 0;
+    if (args.min_len > buf.len or args.min_len > carry_buf.len)
+        return error.MinLenTooLarge;
 
-    var buf = std.Io.Writer.Allocating.init(allocator);
-    _ = try reader.streamRemaining(&buf.writer);
+    while (true) {
+        // leave space for potential carry
+        const read = try file.readAll(buf[carry_len..]);
+        if (read == 0) break;
+        if (carry_len + read > buf.len) return error.BufferOverflow;
 
-    return buf;
+        // does nothing if carry_len == 0
+        @memmove(buf[0..carry_len], carry_buf[0..carry_len]);
+        const bytes = buf[0 .. carry_len + read];
+
+        var iter: StringIterator = .{ .bytes = bytes, .min_len = args.min_len };
+        while (iter.next()) |next| switch (next) {
+            .string => |s| try printString(s, path, args, writer),
+            .carry => |c| {
+                // can occur if size of the carry buffer is smaller than the read buffer
+                if (c.len > carry_buf.len) return error.CarryTooLarge;
+                carry_len = c.len;
+                @memmove(carry_buf[0..carry_len], c[0..carry_len]);
+            },
+        };
+    }
 }
 
-/// Iterator for yielding strings from bytes
+const String = struct {
+    string: []u8,
+    pos: usize,
+};
+
+const NextString = union(enum) {
+    string: String,
+    carry: []u8,
+};
+
+// Iterator for yielding strings from bytes
 const StringIterator = struct {
     bytes: []u8,
     min_len: usize,
     index: usize = 0,
 
-    const StringReturn = struct {
-        string: []u8,
-        index: usize,
-    };
-
     /// Iterates over bytes and yields found strings with length equal or larger than min_len
-    fn next(self: *StringIterator) ?StringReturn {
+    fn next(self: *StringIterator) ?NextString {
         var start: ?usize = null;
         for (self.bytes[self.index..], self.index..) |byte, i| {
             self.index += 1;
@@ -167,13 +180,13 @@ const StringIterator = struct {
             } else if (start) |s| {
                 start = null;
                 const len = i - s;
-                if (len >= self.min_len) return StringReturn{ .string = self.bytes[s..i], .index = s };
+                if (len >= self.min_len) return NextString{ .string = .{ .string = self.bytes[s..i], .pos = s } };
             }
         }
-        // handle string terminated by EOF
+        // return string terminated by the end of buffer as carry
         if (start) |s| {
             const len = self.bytes.len - s;
-            if (len >= self.min_len) return StringReturn{ .string = self.bytes[s..], .index = s };
+            if (len >= self.min_len) return NextString{ .carry = self.bytes[s..] };
         }
         return null;
     }
