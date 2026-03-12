@@ -1,6 +1,8 @@
 const std = @import("std");
 const build_options = @import("build_options");
 
+const READ_BUFFER_SIZE = 64 * 1024;
+
 const USAGE_STR =
     \\Usage: {s} [option(s)] [files(s)]
     \\
@@ -20,7 +22,7 @@ const USAGE_STR =
 const Args = struct {
     print_filename: bool = false,
     min_len: usize = 4,
-    print_loc_format: ?u8 = null,
+    loc_format: ?u8 = null,
     print_help: bool = false,
     print_version: bool = false,
     files: [][:0]u8 = undefined,
@@ -53,7 +55,7 @@ const Args = struct {
                 if (!(std.mem.eql(u8, argv[index], "o") or std.mem.eql(u8, argv[index], "d") or std.mem.eql(u8, argv[index], "x"))) {
                     return error.InvalidArgs;
                 }
-                self.print_loc_format = argv[index][0];
+                self.loc_format = argv[index][0];
             }
             index += 1;
         }
@@ -95,45 +97,75 @@ pub fn main() !void {
         return;
     }
 
-    for (args.files) |file| {
-        try scanFile(file, args, stdout);
+    var ctx: scanCtx = .{
+        .min_len = args.min_len,
+        .loc_format = args.loc_format,
+        .print_filename = args.print_filename,
+        .filename = undefined, // updated on each file read
+        .writer = stdout,
+    };
+
+    for (args.files) |path| {
+        const file = try std.fs.cwd().openFileZ(path, .{ .mode = .read_only });
+        defer file.close();
+        var file_reader = file.reader(&.{});
+        const reader = &file_reader.interface;
+
+        ctx.filename = path;
+        try scanReader(reader, ctx);
     }
 }
 
-/// Formats output string based on provided args and prints it to writer
-fn printString(s: String, filename: [:0]u8, args: Args, writer: *std.Io.Writer) !void {
+const scanCtx = struct {
+    min_len: usize,
+    loc_format: ?u8,
+    print_filename: bool,
+    filename: []const u8,
+    writer: *std.Io.Writer,
+
+    fn print(self: scanCtx, string: []u8, loc: usize) !void {
+        return try printString(string, self.loc_format, loc, self.print_filename, self.filename, self.writer);
+    }
+};
+
+/// Formats output string based on provided options and prints it to writer
+fn printString(
+    string: []u8,
+    loc_format: ?u8,
+    loc: usize,
+    print_filename: bool,
+    filename: []const u8,
+    writer: *std.Io.Writer,
+) error{WriteFailed}!void {
     // not the cleanest approach but is simple and reliable
-    if (args.print_filename) {
-        if (args.print_loc_format) |f| switch (f) {
-            'o' => try writer.print("{s}    {o} {s}\n", .{ filename, s.pos, s.string }),
-            'd' => try writer.print("{s}    {d} {s}\n", .{ filename, s.pos, s.string }),
-            'x' => try writer.print("{s}    {x} {s}\n", .{ filename, s.pos, s.string }),
+    if (print_filename) {
+        if (loc_format) |f| switch (f) {
+            'o' => try writer.print("{s}    {o} {s}\n", .{ filename, loc, string }),
+            'd' => try writer.print("{s}    {d} {s}\n", .{ filename, loc, string }),
+            'x' => try writer.print("{s}    {x} {s}\n", .{ filename, loc, string }),
             else => unreachable,
-        } else try writer.print("{s}    {s}\n", .{ filename, s.string });
-    } else if (args.print_loc_format) |f| switch (f) {
-        'o' => try writer.print("{o} {s}\n", .{ s.pos, s.string }),
-        'd' => try writer.print("{d} {s}\n", .{ s.pos, s.string }),
-        'x' => try writer.print("{x} {s}\n", .{ s.pos, s.string }),
+        } else try writer.print("{s}    {s}\n", .{ filename, string });
+    } else if (loc_format) |f| switch (f) {
+        'o' => try writer.print("{o} {s}\n", .{ loc, string }),
+        'd' => try writer.print("{d} {s}\n", .{ loc, string }),
+        'x' => try writer.print("{x} {s}\n", .{ loc, string }),
         else => unreachable,
     } else {
-        try writer.print("{s}\n", .{s.string});
+        try writer.print("{s}\n", .{string});
     }
 }
 
-/// Reads file in chunks scanning them for strings and writing formatted output to writer
-fn scanFile(path: [:0]u8, args: Args, writer: *std.Io.Writer) !void {
-    const file = try std.fs.cwd().openFileZ(path, .{ .mode = .read_only });
-    defer file.close();
-
-    var buf: [64 * 1024]u8 = undefined;
-    var carry_buf: [64 * 1024]u8 = undefined;
+/// Scans chunks from reader for strings and calls print func from ctx
+fn scanReader(reader: *std.Io.Reader, ctx: scanCtx) !void {
+    var buf: [READ_BUFFER_SIZE]u8 = undefined;
+    var carry_buf: [READ_BUFFER_SIZE]u8 = undefined;
     var carry_len: usize = 0;
-    if (args.min_len > buf.len or args.min_len > carry_buf.len)
+    if (ctx.min_len > buf.len or ctx.min_len > carry_buf.len)
         return error.MinLenTooLarge;
 
     while (true) {
         // leave space for potential carry
-        const read = try file.readAll(buf[carry_len..]);
+        const read = try reader.readSliceShort(buf[carry_len..]);
         if (read == 0) break;
         if (carry_len + read > buf.len) return error.BufferOverflow;
 
@@ -141,9 +173,9 @@ fn scanFile(path: [:0]u8, args: Args, writer: *std.Io.Writer) !void {
         @memmove(buf[0..carry_len], carry_buf[0..carry_len]);
         const bytes = buf[0 .. carry_len + read];
 
-        var iter: StringIterator = .{ .bytes = bytes, .min_len = args.min_len };
-        while (iter.next()) |next| switch (next) {
-            .string => |s| try printString(s, path, args, writer),
+        var iter: StringIterator = .{ .bytes = bytes, .min_len = ctx.min_len };
+        while (iter.next()) |string| switch (string) {
+            .string => |s| try ctx.print(s.string, s.loc),
             .carry => |c| {
                 // can occur if size of the carry buffer is smaller than the read buffer
                 if (c.len > carry_buf.len) return error.CarryTooLarge;
@@ -154,13 +186,11 @@ fn scanFile(path: [:0]u8, args: Args, writer: *std.Io.Writer) !void {
     }
 }
 
-const String = struct {
-    string: []u8,
-    pos: usize,
-};
-
-const NextString = union(enum) {
-    string: String,
+const MaybeString = union(enum) {
+    string: struct {
+        string: []u8,
+        loc: usize,
+    },
     carry: []u8,
 };
 
@@ -171,7 +201,7 @@ const StringIterator = struct {
     index: usize = 0,
 
     /// Iterates over bytes and yields found strings with length equal or larger than min_len
-    fn next(self: *StringIterator) ?NextString {
+    fn next(self: *StringIterator) ?MaybeString {
         var start: ?usize = null;
         for (self.bytes[self.index..], self.index..) |byte, i| {
             self.index += 1;
@@ -180,13 +210,13 @@ const StringIterator = struct {
             } else if (start) |s| {
                 start = null;
                 const len = i - s;
-                if (len >= self.min_len) return NextString{ .string = .{ .string = self.bytes[s..i], .pos = s } };
+                if (len >= self.min_len) return MaybeString{ .string = .{ .string = self.bytes[s..i], .loc = s } };
             }
         }
         // return string terminated by the end of buffer as carry
         if (start) |s| {
             const len = self.bytes.len - s;
-            if (len >= self.min_len) return NextString{ .carry = self.bytes[s..] };
+            if (len >= self.min_len) return MaybeString{ .carry = self.bytes[s..] };
         }
         return null;
     }
