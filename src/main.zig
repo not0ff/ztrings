@@ -1,6 +1,8 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 
+const DEBUG = builtin.mode == .Debug;
 const READ_BUFFER_SIZE = 64 * 1024;
 
 const USAGE_STR =
@@ -101,6 +103,7 @@ pub fn main() !void {
         .min_len = args.min_len,
         .loc_format = args.loc_format,
         .print_filename = args.print_filename,
+        .debug = DEBUG,
         .filename = undefined, // updated on each file read
         .writer = stdout,
     };
@@ -120,11 +123,17 @@ const scanCtx = struct {
     min_len: usize,
     loc_format: ?u8,
     print_filename: bool,
+    debug: bool,
     filename: []const u8,
     writer: *std.Io.Writer,
 
     fn print(self: scanCtx, string: []u8, loc: usize) !void {
         return try printString(string, self.loc_format, loc, self.print_filename, self.filename, self.writer);
+    }
+
+    fn log_stdout(self: scanCtx, comptime fmt: []const u8, args: anytype) !void {
+        if (!DEBUG) return;
+        try self.writer.print(fmt, args);
     }
 };
 
@@ -158,40 +167,38 @@ fn printString(
 /// Scans chunks from reader for strings and calls print func from ctx
 fn scanReader(reader: *std.Io.Reader, ctx: scanCtx) !void {
     var buf: [READ_BUFFER_SIZE]u8 = undefined;
-    var carry_buf: [READ_BUFFER_SIZE]u8 = undefined;
     var carry_len: usize = 0;
-    if (ctx.min_len > buf.len or ctx.min_len > carry_buf.len)
+    if (ctx.min_len > buf.len)
         return error.MinLenTooLarge;
 
+    var loc_offset: usize = 0;
     while (true) {
+        try ctx.log_stdout("reading new buf, carry: {d} \n", .{carry_len});
         // leave space for potential carry
         const read = try reader.readSliceShort(buf[carry_len..]);
         if (read == 0) break;
         if (carry_len + read > buf.len) return error.BufferOverflow;
 
-        // does nothing if carry_len == 0
-        @memmove(buf[0..carry_len], carry_buf[0..carry_len]);
         const bytes = buf[0 .. carry_len + read];
+        carry_len = 0;
 
         var iter: StringIterator = .{ .bytes = bytes, .min_len = ctx.min_len };
-        while (iter.next()) |string| switch (string) {
-            .string => |s| try ctx.print(s.string, s.loc),
-            .carry => |c| {
-                // can occur if size of the carry buffer is smaller than the read buffer
-                if (c.len > carry_buf.len) return error.CarryTooLarge;
-                carry_len = c.len;
-                @memmove(carry_buf[0..carry_len], c[0..carry_len]);
-            },
-        };
+        while (iter.next()) |s| {
+            if (s.carry) {
+                if (s.bytes.len > buf.len) return error.CarryTooLarge;
+                carry_len = s.bytes.len;
+                @memmove(buf[0..carry_len], s.bytes[0..carry_len]);
+            } else try ctx.print(s.bytes, s.loc + loc_offset);
+        }
+        loc_offset += read;
+        try ctx.log_stdout("offset: {x}\n", .{loc_offset});
     }
 }
 
-const MaybeString = union(enum) {
-    string: struct {
-        string: []u8,
-        loc: usize,
-    },
-    carry: []u8,
+const String = struct {
+    bytes: []u8,
+    loc: usize,
+    carry: bool = false,
 };
 
 // Iterator for yielding strings from bytes
@@ -201,7 +208,7 @@ const StringIterator = struct {
     index: usize = 0,
 
     /// Iterates over bytes and yields found strings with length equal or larger than min_len
-    fn next(self: *StringIterator) ?MaybeString {
+    fn next(self: *StringIterator) ?String {
         var start: ?usize = null;
         for (self.bytes[self.index..], self.index..) |byte, i| {
             self.index += 1;
@@ -210,14 +217,129 @@ const StringIterator = struct {
             } else if (start) |s| {
                 start = null;
                 const len = i - s;
-                if (len >= self.min_len) return MaybeString{ .string = .{ .string = self.bytes[s..i], .loc = s } };
+                if (len >= self.min_len) return String{ .bytes = self.bytes[s..i], .loc = s };
             }
         }
-        // return string terminated by the end of buffer as carry
+        // return string terminated by the end of buffer
         if (start) |s| {
             const len = self.bytes.len - s;
-            if (len >= self.min_len) return MaybeString{ .carry = self.bytes[s..] };
+            if (len >= self.min_len) return String{ .bytes = self.bytes[s..], .loc = s, .carry = true };
         }
         return null;
     }
 };
+
+/// Simple helper for testing found strings
+fn expectStrings(iter: *StringIterator, exp_strings: []const []const u8, exp_loc: []const usize, exp_carry: []const bool) !void {
+    var i: usize = 0;
+    while (iter.next()) |s| {
+        try std.testing.expect(i < exp_strings.len);
+        try std.testing.expectEqualStrings(exp_strings[i], s.bytes);
+        try std.testing.expectEqual(exp_loc[i], s.loc);
+        try std.testing.expectEqual(exp_carry[i], s.carry);
+        i += 1;
+    }
+
+    try std.testing.expectEqual(exp_strings.len, i);
+}
+
+test "StringIterator: general" {
+    var bytes: [512]u8 = undefined;
+    @memset(&bytes, 0xFF);
+
+    const offsets = [_]usize{ 23, 93, 130, 200, 288, 355, 480 };
+    const strings = [_][]const u8{
+        "zig",
+        "ztrings",
+        "spam",
+        "foo",
+        "hello world",
+        "AndrewK",
+        "VeryLoooongString",
+    };
+
+    for (offsets, 0..) |o, i| {
+        for (strings[i], 0..) |c, j| {
+            bytes[o + j] = c;
+        }
+    }
+
+    var iter: StringIterator = .{ .bytes = &bytes, .min_len = 3 };
+    try expectStrings(
+        &iter,
+        &strings,
+        &offsets,
+        &[_]bool{false} ** strings.len,
+    );
+
+    iter = .{ .bytes = &bytes, .min_len = 7, .index = 0 };
+    try expectStrings(
+        &iter,
+        &[_][]const u8{ "ztrings", "hello world", "AndrewK", "VeryLoooongString" },
+        &[_]usize{ 93, 288, 355, 480 },
+        &[_]bool{false} ** 7,
+    );
+}
+
+test "test StringIterator: strings at start" {
+    var bytes = [_]u8{ 'v', 'o', 'i', 'd', 0xFF, 0xFF };
+
+    var iter: StringIterator = .{ .bytes = &bytes, .min_len = 4 };
+    try expectStrings(
+        &iter,
+        &[_][]const u8{"void"},
+        &[_]usize{0},
+        &[_]bool{false},
+    );
+}
+
+test "test StringIterator: strings at end" {
+    var bytes = [_]u8{ 0xFF, 0xFF, 't', 'h', 'e', ' ', 'e', 'n', 'd' };
+
+    var iter: StringIterator = .{ .bytes = &bytes, .min_len = 4 };
+    try expectStrings(
+        &iter,
+        &[_][]const u8{"the end"},
+        &[_]usize{2},
+        &[_]bool{true},
+    );
+}
+
+test "test StringIterator: strings at start and end" {
+    var bytes = [_]u8{ 'a', 'b', 0xFF, 0xFF, 'c', 'd', 'e' };
+
+    var iter: StringIterator = .{ .bytes = &bytes, .min_len = 2 };
+    try expectStrings(
+        &iter,
+        &[_][]const u8{ "ab", "cde" },
+        &[_]usize{ 0, 4 },
+        &[_]bool{ false, true },
+    );
+}
+
+test "StringIterator: full string" {
+    var bytes = [_]u8{ 'z', 't', 'r', 'i', 'n', 'g', 's' };
+
+    var iter: StringIterator = .{ .bytes = &bytes, .min_len = 4 };
+
+    try expectStrings(
+        &iter,
+        &[_][]const u8{"ztrings"},
+        &[_]usize{0},
+        &[_]bool{true},
+    );
+}
+
+test "StringIterator: no strings" {
+    var bytes: [64]u8 = undefined;
+    @memset(&bytes, 0x00);
+
+    var iter: StringIterator = .{ .bytes = &bytes, .min_len = 4 };
+
+    try expectStrings(
+        &iter,
+        &[_][]const u8{},
+        &[_]usize{},
+        &[_]bool{},
+    );
+}
