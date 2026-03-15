@@ -188,6 +188,25 @@ const DefaultWriter = struct {
     }
 };
 
+/// Writes location as a string formatted hex value followed by a newline
+///
+/// i.e. index 0 -> 0x0; index 255  -> 0xFF
+const LocationWriter = struct {
+    writer: *std.Io.Writer,
+
+    fn write(ptr: *anyopaque, s: String) error{WriteFailed}!void {
+        const self: *LocationWriter = @ptrCast(@alignCast(ptr));
+        try self.writer.print("0x{X}\n", .{s.loc});
+    }
+
+    fn Writer(self: *LocationWriter) StringWriter {
+        return .{
+            .ptr = self,
+            .writeFn = write,
+        };
+    }
+};
+
 /// Writer formatting found strings by including optional filename and location
 const FormattedWriter = struct {
     writer: *std.Io.Writer,
@@ -221,9 +240,11 @@ const FormattedWriter = struct {
 };
 
 /// Reads strings from Reader and writes them to StringWriter
+///
+/// min_len must be less or equal to read_len
 fn copyStrings(comptime read_len: usize, min_len: usize, reader: *std.Io.Reader, writer: *StringWriter) !void {
     if (min_len > read_len)
-        return error.MinLenTooLarge;
+        return error.BufferTooSmall;
 
     var buf: [read_len * 2]u8 = undefined;
 
@@ -247,9 +268,9 @@ fn copyStrings(comptime read_len: usize, min_len: usize, reader: *std.Io.Reader,
         loc_offset += read;
     }
 
-    // handle carry at the end of buffer
+    // handle carry at the end of read buffer
     if (carry_len > 0) {
-        const string: String = .{ .bytes = buf[0..carry_len], .loc = loc_offset };
+        const string: String = .{ .bytes = buf[0..carry_len], .loc = loc_offset - carry_len };
         try writer.write(string);
     }
 }
@@ -451,11 +472,60 @@ test "copyStrings: string splitted by buffer" {
     );
 }
 
-test "copyStrings: min_len too large error" {
+test "copyStrings: buffer too small error" {
     try std.testing.expectError(
-        error.MinLenTooLarge,
+        error.BufferTooSmall,
         copyStringsFromBuffer(8, 16, &[_]u8{
             'Z', 'i', 'g',
         }),
     );
+}
+
+test "copyStrings: location inside buffer" {
+    const buffer = [_]u8{
+        0xFF, 'x', 'z', 0xFF, 0xFF, '0', '1', 0xFF,
+    };
+    var reader: std.Io.Reader = .fixed(&buffer);
+
+    var write_buf: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&write_buf);
+
+    var std_writer: LocationWriter = .{ .writer = &writer };
+    var str_writer = std_writer.Writer();
+
+    try copyStrings(8, 2, &reader, &str_writer);
+    try std.testing.expectEqualStrings("0x1\n0x5\n", writer.buffered());
+}
+
+test "copyStrings: location at buffer edges" {
+    const buffer = [_]u8{
+        't', 'e', 's', 't', 0xFF, 'i', 'n', 'g',
+    };
+    var reader: std.Io.Reader = .fixed(&buffer);
+
+    var write_buf: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&write_buf);
+
+    var std_writer: LocationWriter = .{ .writer = &writer };
+    var str_writer = std_writer.Writer();
+
+    try copyStrings(8, 3, &reader, &str_writer);
+    try std.testing.expectEqualStrings("0x0\n0x5\n", writer.buffered());
+}
+
+test "copyStrings: location in many reads" {
+    const buffer = [_]u8{
+        't',  'e', 's',  't',  0xFF, 'i', 'n', 'g',
+        0xFF, ' ', 0xFF, 0xFF, 'c',  'a', 's', 'e',
+    };
+    var reader: std.Io.Reader = .fixed(&buffer);
+
+    var write_buf: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&write_buf);
+
+    var std_writer: LocationWriter = .{ .writer = &writer };
+    var str_writer = std_writer.Writer();
+
+    try copyStrings(8, 1, &reader, &str_writer);
+    try std.testing.expectEqualStrings("0x0\n0x5\n0x9\n0xC\n", writer.buffered());
 }
