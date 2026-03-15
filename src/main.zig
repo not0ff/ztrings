@@ -20,6 +20,52 @@ const USAGE_STR =
     \\
 ;
 
+pub fn main() !void {
+    const alloc = std.heap.page_allocator;
+    const argv = try std.process.argsAlloc(alloc);
+    defer std.process.argsFree(alloc, argv);
+
+    var stdout_buf: [1024]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
+    const stdout = &stdout_writer.interface;
+    defer stdout.flush() catch {};
+
+    var args = Args{};
+    args.parseArgs(argv) catch |err| {
+        switch (err) {
+            error.InvalidArgs => try stdout.writeAll("Error: invalid arguments provided!\n"),
+            error.MissingArgs => try stdout.writeAll("Error: missing arguments!\n"),
+            error.NotImplemented => try stdout.writeAll("Error: option not implemented!\n"),
+        }
+        try stdout.print(USAGE_STR, .{build_options.exe_name});
+        return;
+    };
+
+    if (args.print_help) {
+        try stdout.print(USAGE_STR, .{build_options.exe_name});
+        return;
+    } else if (args.print_version) {
+        try stdout.print("{s} {s}\n", .{ build_options.exe_name, build_options.version });
+        return;
+    }
+
+    var fmt_writer: FormattedWriter = .{
+        .writer = stdout,
+        .loc_format = args.loc_format,
+    };
+    var writer = fmt_writer.Writer();
+
+    for (args.files) |path| {
+        const file = try std.fs.cwd().openFileZ(path, .{ .mode = .read_only });
+        defer file.close();
+        var file_reader = file.reader(&.{});
+        const reader = &file_reader.interface;
+
+        if (args.print_filename) fmt_writer.setFilename(path);
+        try copyStrings(args.min_len, reader, &writer);
+    }
+}
+
 /// Struct holding command-line options
 const Args = struct {
     print_filename: bool = false,
@@ -70,145 +116,19 @@ const Args = struct {
     }
 };
 
-pub fn main() !void {
-    const alloc = std.heap.page_allocator;
-    const argv = try std.process.argsAlloc(alloc);
-    defer std.process.argsFree(alloc, argv);
-
-    var stdout_buf: [1024]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
-    const stdout = &stdout_writer.interface;
-    defer stdout.flush() catch {};
-
-    var args = Args{};
-    args.parseArgs(argv) catch |err| {
-        switch (err) {
-            error.InvalidArgs => try stdout.writeAll("Error: invalid arguments provided!\n"),
-            error.MissingArgs => try stdout.writeAll("Error: missing arguments!\n"),
-            error.NotImplemented => try stdout.writeAll("Error: option not implemented!\n"),
-        }
-        try stdout.print(USAGE_STR, .{build_options.exe_name});
-        return;
-    };
-
-    if (args.print_help) {
-        try stdout.print(USAGE_STR, .{build_options.exe_name});
-        return;
-    } else if (args.print_version) {
-        try stdout.print("{s} {s}\n", .{ build_options.exe_name, build_options.version });
-        return;
-    }
-
-    var ctx: scanCtx = .{
-        .min_len = args.min_len,
-        .loc_format = args.loc_format,
-        .print_filename = args.print_filename,
-        .debug = DEBUG,
-        .filename = undefined, // updated on each file read
-        .writer = stdout,
-    };
-
-    for (args.files) |path| {
-        const file = try std.fs.cwd().openFileZ(path, .{ .mode = .read_only });
-        defer file.close();
-        var file_reader = file.reader(&.{});
-        const reader = &file_reader.interface;
-
-        ctx.filename = path;
-        try scanReader(reader, ctx);
-    }
-}
-
-const scanCtx = struct {
-    min_len: usize,
-    loc_format: ?u8,
-    print_filename: bool,
-    debug: bool,
-    filename: []const u8,
-    writer: *std.Io.Writer,
-
-    fn print(self: scanCtx, string: []u8, loc: usize) !void {
-        return try printString(string, self.loc_format, loc, self.print_filename, self.filename, self.writer);
-    }
-
-    fn log_stdout(self: scanCtx, comptime fmt: []const u8, args: anytype) !void {
-        if (!DEBUG) return;
-        try self.writer.print(fmt, args);
-    }
-};
-
-/// Formats output string based on provided options and prints it to writer
-fn printString(
-    string: []u8,
-    loc_format: ?u8,
-    loc: usize,
-    print_filename: bool,
-    filename: []const u8,
-    writer: *std.Io.Writer,
-) error{WriteFailed}!void {
-    // not the cleanest approach but is simple and reliable
-    if (print_filename) {
-        if (loc_format) |f| switch (f) {
-            'o' => try writer.print("{s}    {o} {s}\n", .{ filename, loc, string }),
-            'd' => try writer.print("{s}    {d} {s}\n", .{ filename, loc, string }),
-            'x' => try writer.print("{s}    {x} {s}\n", .{ filename, loc, string }),
-            else => unreachable,
-        } else try writer.print("{s}    {s}\n", .{ filename, string });
-    } else if (loc_format) |f| switch (f) {
-        'o' => try writer.print("{o} {s}\n", .{ loc, string }),
-        'd' => try writer.print("{d} {s}\n", .{ loc, string }),
-        'x' => try writer.print("{x} {s}\n", .{ loc, string }),
-        else => unreachable,
-    } else {
-        try writer.print("{s}\n", .{string});
-    }
-}
-
-/// Scans chunks from reader for strings and calls print func from ctx
-fn scanReader(reader: *std.Io.Reader, ctx: scanCtx) !void {
-    var buf: [READ_BUFFER_SIZE]u8 = undefined;
-    var carry_len: usize = 0;
-    if (ctx.min_len > buf.len)
-        return error.MinLenTooLarge;
-
-    var loc_offset: usize = 0;
-    while (true) {
-        try ctx.log_stdout("reading new buf, carry: {d} \n", .{carry_len});
-        // leave space for potential carry
-        const read = try reader.readSliceShort(buf[carry_len..]);
-        if (read == 0) break;
-        if (carry_len + read > buf.len) return error.BufferOverflow;
-
-        const bytes = buf[0 .. carry_len + read];
-        carry_len = 0;
-
-        var iter: StringIterator = .{ .bytes = bytes, .min_len = ctx.min_len };
-        while (iter.next()) |s| {
-            if (s.carry) {
-                if (s.bytes.len > buf.len) return error.CarryTooLarge;
-                carry_len = s.bytes.len;
-                @memmove(buf[0..carry_len], s.bytes[0..carry_len]);
-            } else try ctx.print(s.bytes, s.loc + loc_offset);
-        }
-        loc_offset += read;
-        try ctx.log_stdout("offset: {x}\n", .{loc_offset});
-    }
-}
-
-const String = struct {
-    bytes: []u8,
-    loc: usize,
-    carry: bool = false,
-};
-
-// Iterator for yielding strings from bytes
+/// Iterator yielding ascii-printable strings found in bytes
 const StringIterator = struct {
     bytes: []u8,
     min_len: usize,
     index: usize = 0,
 
-    /// Iterates over bytes and yields found strings with length equal or larger than min_len
-    fn next(self: *StringIterator) ?String {
+    const StringInfo = struct {
+        bytes: []const u8,
+        loc: usize,
+        last: bool = false,
+    };
+
+    fn next(self: *StringIterator) ?StringInfo {
         var start: ?usize = null;
         for (self.bytes[self.index..], self.index..) |byte, i| {
             self.index += 1;
@@ -217,26 +137,113 @@ const StringIterator = struct {
             } else if (start) |s| {
                 start = null;
                 const len = i - s;
-                if (len >= self.min_len) return String{ .bytes = self.bytes[s..i], .loc = s };
+                if (len >= self.min_len) return .{
+                    .bytes = self.bytes[s..i],
+                    .loc = s,
+                };
             }
         }
         // return string terminated by the end of buffer
         if (start) |s| {
             const len = self.bytes.len - s;
-            if (len >= self.min_len) return String{ .bytes = self.bytes[s..], .loc = s, .carry = true };
+            if (len >= self.min_len) return .{
+                .bytes = self.bytes[s..],
+                .loc = s,
+                .last = true,
+            };
         }
         return null;
     }
 };
 
+/// General string type with offset location
+const String = struct {
+    bytes: []const u8,
+    loc: usize,
+};
+
+/// Interface for writers handling found strings
+const StringWriter = struct {
+    ptr: *anyopaque,
+    writeFn: *const fn (ptr: *anyopaque, string: String) anyerror!void,
+
+    fn write(self: StringWriter, string: String) !void {
+        return self.writeFn(self.ptr, string);
+    }
+};
+
+/// Writer formatting found strings by including optional filename and location
+const FormattedWriter = struct {
+    writer: *std.Io.Writer,
+    loc_format: ?u8,
+    filename: ?[]const u8 = null,
+
+    inline fn setFilename(self: *FormattedWriter, f: []const u8) void {
+        self.filename = f;
+    }
+
+    fn write(ptr: *anyopaque, s: String) error{ InvalidFormat, WriteFailed }!void {
+        const self: *FormattedWriter = @ptrCast(@alignCast(ptr));
+        if (self.filename) |f| {
+            try self.writer.print("{s}    ", .{f});
+        }
+        if (self.loc_format) |fmt| switch (fmt) {
+            'o' => try self.writer.print("{o} ", .{s.loc}),
+            'd' => try self.writer.print("{d} ", .{s.loc}),
+            'x' => try self.writer.print("{x} ", .{s.loc}),
+            else => return error.InvalidFormat,
+        };
+        try self.writer.print("{s}\n", .{s.bytes});
+    }
+
+    fn Writer(self: *FormattedWriter) StringWriter {
+        return .{
+            .ptr = self,
+            .writeFn = write,
+        };
+    }
+};
+
+/// Reads strings from Reader and writes them to StringWriter
+fn copyStrings(min_len: usize, reader: *std.Io.Reader, str_writer: *StringWriter) !void {
+    var buf: [READ_BUFFER_SIZE]u8 = undefined;
+    if (min_len > buf.len)
+        return error.MinLenTooLarge;
+
+    var carry_len: usize = 0;
+    var loc_offset: usize = 0;
+    while (true) {
+        // leave space for potential carry
+        const read = try reader.readSliceShort(buf[carry_len..]);
+        if (read == 0) break;
+        if (carry_len + read > buf.len) return error.BufferOverflow;
+
+        const bytes = buf[0 .. carry_len + read];
+        carry_len = 0;
+
+        var iter: StringIterator = .{ .bytes = bytes, .min_len = min_len };
+        while (iter.next()) |s| {
+            if (s.last) {
+                if (s.bytes.len > buf.len) return error.CarryTooLarge;
+                carry_len = s.bytes.len;
+                @memmove(buf[0..carry_len], s.bytes[0..carry_len]);
+            } else {
+                const string: String = .{ .bytes = s.bytes, .loc = s.loc + loc_offset };
+                try str_writer.write(string);
+            }
+        }
+        loc_offset += read;
+    }
+}
+
 /// Simple helper for testing found strings
-fn expectStrings(iter: *StringIterator, exp_strings: []const []const u8, exp_loc: []const usize, exp_carry: []const bool) !void {
+fn expectStrings(iter: *StringIterator, exp_strings: []const []const u8, exp_loc: []const usize, exp_last: []const bool) !void {
     var i: usize = 0;
     while (iter.next()) |s| {
         try std.testing.expect(i < exp_strings.len);
         try std.testing.expectEqualStrings(exp_strings[i], s.bytes);
         try std.testing.expectEqual(exp_loc[i], s.loc);
-        try std.testing.expectEqual(exp_carry[i], s.carry);
+        try std.testing.expectEqual(exp_last[i], s.last);
         i += 1;
     }
 
