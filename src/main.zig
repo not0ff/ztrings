@@ -2,7 +2,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 
-const DEBUG = builtin.mode == .Debug;
 const READ_BUFFER_SIZE = 64 * 1024;
 
 const USAGE_STR =
@@ -62,7 +61,7 @@ pub fn main() !void {
         const reader = &file_reader.interface;
 
         if (args.print_filename) fmt_writer.setFilename(path);
-        try copyStrings(args.min_len, reader, &writer);
+        try copyStrings(READ_BUFFER_SIZE, args.min_len, reader, &writer);
     }
 }
 
@@ -123,7 +122,7 @@ const StringIterator = struct {
     index: usize = 0,
 
     const StringInfo = struct {
-        bytes: []const u8,
+        bytes: []u8,
         loc: usize,
         last: bool = false,
     };
@@ -172,6 +171,23 @@ const StringWriter = struct {
     }
 };
 
+/// Default writer writes unformatted string to provided writer
+const DefaultWriter = struct {
+    writer: *std.Io.Writer,
+
+    fn write(ptr: *anyopaque, s: String) error{WriteFailed}!void {
+        const self: *DefaultWriter = @ptrCast(@alignCast(ptr));
+        try self.writer.writeAll(s.bytes);
+    }
+
+    fn Writer(self: *DefaultWriter) StringWriter {
+        return .{
+            .ptr = self,
+            .writeFn = write,
+        };
+    }
+};
+
 /// Writer formatting found strings by including optional filename and location
 const FormattedWriter = struct {
     writer: *std.Io.Writer,
@@ -205,10 +221,11 @@ const FormattedWriter = struct {
 };
 
 /// Reads strings from Reader and writes them to StringWriter
-fn copyStrings(min_len: usize, reader: *std.Io.Reader, str_writer: *StringWriter) !void {
-    var buf: [READ_BUFFER_SIZE]u8 = undefined;
-    if (min_len > buf.len)
+fn copyStrings(comptime read_len: usize, min_len: usize, reader: *std.Io.Reader, writer: *StringWriter) !void {
+    if (min_len > read_len)
         return error.MinLenTooLarge;
+
+    var buf: [read_len * 2]u8 = undefined;
 
     var carry_len: usize = 0;
     var loc_offset: usize = 0;
@@ -216,28 +233,29 @@ fn copyStrings(min_len: usize, reader: *std.Io.Reader, str_writer: *StringWriter
         // leave space for potential carry
         const read = try reader.readSliceShort(buf[carry_len..]);
         if (read == 0) break;
-        if (carry_len + read > buf.len) return error.BufferOverflow;
 
-        const bytes = buf[0 .. carry_len + read];
-        carry_len = 0;
-
-        var iter: StringIterator = .{ .bytes = bytes, .min_len = min_len };
+        var iter: StringIterator = .{ .bytes = buf[0 .. carry_len + read], .min_len = min_len };
         while (iter.next()) |s| {
+            carry_len = if (s.last) s.bytes.len else 0;
             if (s.last) {
-                if (s.bytes.len > buf.len) return error.CarryTooLarge;
-                carry_len = s.bytes.len;
-                @memmove(buf[0..carry_len], s.bytes[0..carry_len]);
+                @memmove(buf[0..carry_len], s.bytes);
             } else {
                 const string: String = .{ .bytes = s.bytes, .loc = s.loc + loc_offset };
-                try str_writer.write(string);
+                try writer.write(string);
             }
         }
         loc_offset += read;
     }
+
+    // handle carry at the end of buffer
+    if (carry_len > 0) {
+        const string: String = .{ .bytes = buf[0..carry_len], .loc = loc_offset };
+        try writer.write(string);
+    }
 }
 
 /// Simple helper for testing found strings
-fn expectStrings(iter: *StringIterator, exp_strings: []const []const u8, exp_loc: []const usize, exp_last: []const bool) !void {
+fn expectStringsFromIter(iter: *StringIterator, exp_strings: []const []const u8, exp_loc: []const usize, exp_last: []const bool) !void {
     var i: usize = 0;
     while (iter.next()) |s| {
         try std.testing.expect(i < exp_strings.len);
@@ -272,7 +290,7 @@ test "StringIterator: general" {
     }
 
     var iter: StringIterator = .{ .bytes = &bytes, .min_len = 3 };
-    try expectStrings(
+    try expectStringsFromIter(
         &iter,
         &strings,
         &offsets,
@@ -280,7 +298,7 @@ test "StringIterator: general" {
     );
 
     iter = .{ .bytes = &bytes, .min_len = 7, .index = 0 };
-    try expectStrings(
+    try expectStringsFromIter(
         &iter,
         &[_][]const u8{ "ztrings", "hello world", "AndrewK", "VeryLoooongString" },
         &[_]usize{ 93, 288, 355, 480 },
@@ -292,7 +310,7 @@ test "test StringIterator: strings at start" {
     var bytes = [_]u8{ 'v', 'o', 'i', 'd', 0xFF, 0xFF };
 
     var iter: StringIterator = .{ .bytes = &bytes, .min_len = 4 };
-    try expectStrings(
+    try expectStringsFromIter(
         &iter,
         &[_][]const u8{"void"},
         &[_]usize{0},
@@ -304,7 +322,7 @@ test "test StringIterator: strings at end" {
     var bytes = [_]u8{ 0xFF, 0xFF, 't', 'h', 'e', ' ', 'e', 'n', 'd' };
 
     var iter: StringIterator = .{ .bytes = &bytes, .min_len = 4 };
-    try expectStrings(
+    try expectStringsFromIter(
         &iter,
         &[_][]const u8{"the end"},
         &[_]usize{2},
@@ -316,7 +334,7 @@ test "test StringIterator: strings at start and end" {
     var bytes = [_]u8{ 'a', 'b', 0xFF, 0xFF, 'c', 'd', 'e' };
 
     var iter: StringIterator = .{ .bytes = &bytes, .min_len = 2 };
-    try expectStrings(
+    try expectStringsFromIter(
         &iter,
         &[_][]const u8{ "ab", "cde" },
         &[_]usize{ 0, 4 },
@@ -329,7 +347,7 @@ test "StringIterator: full string" {
 
     var iter: StringIterator = .{ .bytes = &bytes, .min_len = 4 };
 
-    try expectStrings(
+    try expectStringsFromIter(
         &iter,
         &[_][]const u8{"ztrings"},
         &[_]usize{0},
@@ -341,12 +359,103 @@ test "StringIterator: no strings" {
     var bytes: [64]u8 = undefined;
     @memset(&bytes, 0x00);
 
-    var iter: StringIterator = .{ .bytes = &bytes, .min_len = 4 };
+    var iter: StringIterator = .{ .bytes = &bytes, .min_len = 1 };
 
-    try expectStrings(
+    try expectStringsFromIter(
         &iter,
         &[_][]const u8{},
         &[_]usize{},
         &[_]bool{},
+    );
+}
+
+test "StringIterator: empty" {
+    var bytes = [_]u8{};
+    var iter: StringIterator = .{ .bytes = &bytes, .min_len = 1 };
+
+    try expectStringsFromIter(
+        &iter,
+        &[_][]const u8{},
+        &[_]usize{},
+        &[_]bool{},
+    );
+}
+
+/// Helper for testing copyStrings function
+fn copyStringsFromBuffer(comptime read_len: usize, min_len: usize, buffer: []const u8) ![]u8 {
+    var reader: std.Io.Reader = .fixed(buffer);
+
+    var write_buf: [4096]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&write_buf);
+
+    var std_writer: DefaultWriter = .{ .writer = &writer };
+    var str_writer = std_writer.Writer();
+
+    try copyStrings(read_len, min_len, &reader, &str_writer);
+    return writer.buffered();
+}
+
+test "copyStrings: empty" {
+    try std.testing.expectEqualStrings(
+        "",
+        try copyStringsFromBuffer(8, 1, &[_]u8{}),
+    );
+}
+
+test "copyStrings: single string" {
+    try std.testing.expectEqualStrings(
+        "single",
+        try copyStringsFromBuffer(8, 1, &[_]u8{
+            's', 'i', 'n', 'g', 'l', 'e',
+        }),
+    );
+}
+
+test "copyStrings: many strings at buffer start" {
+    try std.testing.expectEqualStrings(
+        "abc xkcd",
+        try copyStringsFromBuffer(8, 1, &[_]u8{
+            'a', 'b', 'c', ' ', 0xFF, 0xFF, 0xFF, 0xFF,
+            'x', 'k', 'c', 'd', 0xFF, 0xFF, 0xFF, 0xFF,
+        }),
+    );
+}
+
+test "copyStrings: strings in middle of buffer" {
+    try std.testing.expectEqualStrings(
+        "abcd efg",
+        try copyStringsFromBuffer(8, 1, &[_]u8{
+            0xFF, 'a',  'b', 'c', 'd', 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF, ' ', 'e', 'f', 0xFF, 'g',  0xFF,
+        }),
+    );
+}
+
+test "copyStrings: strings at buffer end" {
+    try std.testing.expectEqualStrings(
+        "BBS? yes!",
+        try copyStringsFromBuffer(8, 1, &[_]u8{
+            0xFF, 0xFF, 0xFF, 0xFF, 'B', 'B', 'S', '?',
+            0xFF, 0xFF, 0xFF, ' ',  'y', 'e', 's', '!',
+        }),
+    );
+}
+
+test "copyStrings: string splitted by buffer" {
+    try std.testing.expectEqualStrings(
+        "ztrings",
+        try copyStringsFromBuffer(8, 1, &[_]u8{
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 'z',  't',  'r',
+            'i',  'n',  'g',  's',  0xFF, 0xFF, 0xFF, 0xFF,
+        }),
+    );
+}
+
+test "copyStrings: min_len too large error" {
+    try std.testing.expectError(
+        error.MinLenTooLarge,
+        copyStringsFromBuffer(8, 16, &[_]u8{
+            'Z', 'i', 'g',
+        }),
     );
 }
