@@ -1,7 +1,7 @@
 .{
     .name = .ztrings,
-    .version = "1.0.0",
-    .minimum_zig_version = "0.15.2",
+    .version = "1.0.1",
+    .minimum_zig_version = "0.16.0",
     .paths = .{""},
     .fingerprint = 0x21022f2691f59c00,
 }

@@ -26,17 +26,17 @@ Usage: ztrings [option(s)] [files(s)]
 ```
 
 ## Compiling
-The project can be easily build from source using the zig 0.15.2 compiler<br>
-- Step 1: clone the git repository
+The project should be built with version 0.16.0 of Zig<br>
+- Step 1: clone the repository
 ```
 $ git clone https://github.com/not0ff/ztrings.git
 ```
-- Step 2: build using the zig compiler *(default mode: ReleaseFast)* <br>
+- Step 2: build using Zig <br>
   - Run directly:
     ```
     $ zig build run -- [option(s)] [files(s)]
     ```
-  - Save the binary in zig-out/bin:
+  - Save the binary in *zig-out/bin*:
     ```
     $ zig build -Drelease=true  
     $ ./zig-out/bin/ztrings [option(s)] [files(s)]

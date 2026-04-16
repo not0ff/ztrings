@@ -34,7 +34,7 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the application");
     run_step.dependOn(&run_exe.step);
 
-    const test_step = b.step("test", "Run unit test");
+    const test_step = b.step("test", "Run unit tests");
 
     const native_target: std.Target.Query = .{};
     const unit_tests = b.addTest(.{

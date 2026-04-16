@@ -35,24 +35,34 @@ const USAGE_STR =
     \\
 ;
 
-pub fn main() !void {
-    const alloc = std.heap.page_allocator;
-    const argv = try std.process.argsAlloc(alloc);
-    defer std.process.argsFree(alloc, argv);
+/// Struct holding command-line options
+const Args = struct {
+    min_len: usize = 4,
+    loc_format: ?u8 = null,
+    print_filename: bool = false,
+    print_help: bool = false,
+    print_version: bool = false,
+    files: [][:0]const u8,
+};
 
-    var stdout_buf: [1024]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const arena = init.arena;
+    const allocator = arena.allocator();
+
+    var buf: [1024]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(io, &buf);
     const stdout = &stdout_writer.interface;
     defer stdout.flush() catch {};
 
-    var args = Args{};
-    args.parseArgs(argv) catch |err| {
+    var args_parser: ArgsParser = .init(init.minimal.args, allocator);
+    const args = args_parser.parse() catch |err| {
         switch (err) {
-            error.InvalidArgs => try stdout.writeAll("Error: invalid arguments provided!\n"),
-            error.MissingArgs => try stdout.writeAll("Error: missing arguments!\n"),
-            error.NotImplemented => try stdout.writeAll("Error: option not implemented!\n"),
+            error.InvalidArgs => try stdout.writeAll("error: invalid arguments provided!\n"),
+            error.MissingArgs => try stdout.writeAll("error: missing arguments!\n"),
+            error.NotImplemented => try stdout.writeAll("error: option not implemented!\n"),
+            else => try stdout.writeAll("error: cannot parse args\n"),
         }
-        try stdout.print(USAGE_STR, .{build_options.exe_name});
         return;
     };
 
@@ -64,70 +74,79 @@ pub fn main() !void {
         return;
     }
 
-    var fmt_writer: FormattedWriter = .{
+    var format: FormattedWriter = .{
         .writer = stdout,
         .loc_format = args.loc_format,
     };
-    var writer = fmt_writer.Writer();
+    var writer = format.Writer();
 
+    const cwd = std.Io.Dir.cwd();
     for (args.files) |path| {
-        const file = try std.fs.cwd().openFileZ(path, .{ .mode = .read_only });
-        defer file.close();
-        var file_reader = file.reader(&.{});
+        const file = try cwd.openFile(io, path, .{ .mode = .read_only });
+        defer file.close(io);
+
+        var file_reader = file.reader(io, &.{});
         const reader = &file_reader.interface;
 
-        if (args.print_filename) fmt_writer.setFilename(path);
+        if (args.print_filename) format.setFilename(path);
         try copyStrings(READ_BUFFER_SIZE, args.min_len, reader, &writer);
     }
 }
 
-/// Struct holding command-line options
-const Args = struct {
-    print_filename: bool = false,
-    min_len: usize = 4,
-    loc_format: ?u8 = null,
-    print_help: bool = false,
-    print_version: bool = false,
-    files: [][:0]u8 = undefined,
+const ArgsParser = struct {
+    args: std.process.Args,
+    allocator: std.mem.Allocator,
 
-    const ArgParseError = error{ MissingArgs, InvalidArgs, NotImplemented };
+    const ParseError = error{ MissingArgs, InvalidArgs, NotImplemented, OutOfMemory };
 
-    /// Parses argv array into the struct fields
-    fn parseArgs(self: *Args, argv: [][:0]u8) ArgParseError!void {
-        // parse optional arguments starting with a dash '-'
-        var index: usize = 1;
-        while (index < argv.len and argv[index][0] == '-') {
-            if (std.mem.eql(u8, argv[index], "-h")) {
-                self.print_help = true;
-                return;
-            } else if (std.mem.eql(u8, argv[index], "-v")) {
-                self.print_version = true;
-                return;
-            } else if (std.mem.eql(u8, argv[index], "-f")) {
-                self.print_filename = true;
-            } else if (std.mem.eql(u8, argv[index], "-n")) {
-                if (index + 1 >= argv.len) return error.MissingArgs;
-                index += 1;
-                self.min_len = std.fmt.parseInt(usize, argv[index], 10) catch {
-                    return error.InvalidArgs;
+    fn init(args: std.process.Args, allocator: std.mem.Allocator) ArgsParser {
+        return ArgsParser{ .args = args, .allocator = allocator };
+    }
+
+    fn parse(self: *ArgsParser) ParseError!Args {
+        var args = Args{ .files = &[_][:0]const u8{} };
+
+        var it = self.args.iterate();
+        _ = it.next();
+        while (it.next()) |arg| {
+            if (arg[0] != '-') {
+                args.files = blk: {
+                    var files: std.ArrayList([:0]const u8) = .empty;
+                    defer files.deinit(self.allocator);
+
+                    try files.append(self.allocator, arg);
+                    while (it.next()) |file| {
+                        try files.append(self.allocator, file);
+                    }
+                    break :blk try files.toOwnedSlice(self.allocator);
                 };
-                if (self.min_len < 1 or self.min_len >= 1024) return error.InvalidArgs;
-            } else if (std.mem.eql(u8, argv[index], "-t")) {
-                if (index + 1 >= argv.len) return error.MissingArgs;
-                index += 1;
-                if (!(std.mem.eql(u8, argv[index], "o") or std.mem.eql(u8, argv[index], "d") or std.mem.eql(u8, argv[index], "x"))) {
+                continue;
+            }
+
+            if (std.mem.eql(u8, arg, "-h")) {
+                args.print_help = true;
+                break;
+            } else if (std.mem.eql(u8, arg, "-v")) {
+                args.print_version = true;
+                break;
+            } else if (std.mem.eql(u8, arg, "-f")) {
+                args.print_filename = true;
+            } else if (std.mem.eql(u8, arg, "-n")) {
+                const next = it.next() orelse return error.InvalidArgs;
+                const parsed = std.fmt.parseInt(usize, next, 10) catch return error.InvalidArgs;
+                if (parsed < 1 or parsed >= 1024) return error.InvalidArgs;
+                args.min_len = parsed;
+            } else if (std.mem.eql(u8, arg, "-t")) {
+                const t = it.next() orelse return error.InvalidArgs;
+                if (!(std.mem.eql(u8, t, "o") or std.mem.eql(u8, t, "d") or std.mem.eql(u8, t, "x"))) {
                     return error.InvalidArgs;
                 }
-                self.loc_format = argv[index][0];
-            }
-            index += 1;
+                args.loc_format = t[0];
+            } else return error.InvalidArgs;
+        } else {
+            if (args.files.len <= 0) return error.MissingArgs;
         }
-
-        // parse positional arguments
-        if (argv.len - index < 1) return error.MissingArgs;
-
-        self.files = argv[index..];
-        return;
+        return args;
     }
 };
 
